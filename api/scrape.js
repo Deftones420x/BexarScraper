@@ -1,12 +1,14 @@
 const https = require('https');
 
+const BASE_HOST = 'bexar.tx.publicsearch.us';
+
 const DOC_TYPES = {
   foreclosure: { label: 'Foreclosure / Trustee Sale', category: 'foreclosure', codes: ['NOTS','SUBST','FOREC','NOSAL','NOTRS'] },
-  deed: { label: 'Deeds', category: 'deed', codes: ['WARRD','QUITD','SPWRD','DEED','DEEDT'] },
-  lien: { label: 'Liens', category: 'lien', codes: ['TAXLN','MECHL','HOALN','JUDLN','IRSLN','FEDTL'] },
-  probate: { label: 'Probate / Heirship', category: 'probate', codes: ['PROBAT','HEIRSH','AFFH','WILL','LTTEST'] },
-  lispendens: { label: 'Lis Pendens', category: 'lispendens', codes: ['LISPEN','LISPN'] },
-  court: { label: 'Bankruptcy / Divorce / Eviction', category: 'court', codes: ['BANKR','DIVRC','EVICT','FED','CH7','CH13'] }
+  deed:        { label: 'Deeds', category: 'deed', codes: ['WARRD','QUITD','SPWRD','DEED','DEEDT'] },
+  lien:        { label: 'Liens', category: 'lien', codes: ['TAXLN','MECHL','HOALN','JUDLN','IRSLN','FEDTL'] },
+  probate:     { label: 'Probate / Heirship', category: 'probate', codes: ['PROBAT','HEIRSH','AFFH','WILL','LTTEST'] },
+  lispendens:  { label: 'Lis Pendens', category: 'lispendens', codes: ['LISPEN','LISPN'] },
+  court:       { label: 'Bankruptcy / Divorce / Eviction', category: 'court', codes: ['BANKR','DIVRC','EVICT','FED','CH7','CH13'] }
 };
 
 const MS_WEIGHTS = {
@@ -30,107 +32,141 @@ function getMSFlags(category, docType) {
     flags.push('multilien');
   }
   if (category === 'court') {
-    if (doc.includes('bankr')) flags.push('bk');
+    if (doc.includes('bankr') || doc.includes('ch')) flags.push('bk');
     if (doc.includes('divorc')) flags.push('divorce');
   }
   return [...new Set(flags)];
 }
 
-function buildURL(codes, fromDate, toDate) {
-  const params = new URLSearchParams({
-    department: 'RP',
-    docTypes: codes.join(','),
-    limit: '250',
-    offset: '0',
-    recordedDateRange: `${fromDate},${toDate}`,
-    searchType: 'advancedSearch',
-    keywordSearch: 'false',
-    searchOcrText: 'false'
-  });
-  return `https://bexar.tx.publicsearch.us/results?${params.toString()}`;
+function getDateRange() {
+  const now = new Date();
+  const to = now.toISOString().slice(0, 10).replace(/-/g, '');
+  const from = new Date(now - 14 * 24 * 60 * 60 * 1000)
+    .toISOString().slice(0, 10).replace(/-/g, '');
+  return { from, to };
 }
 
-function httpGet(url) {
+function fetchAPI(codes, fromDate, toDate, offset) {
   return new Promise((resolve, reject) => {
-    https.get(url, {
+    const params = new URLSearchParams({
+      department: 'RP',
+      docTypes: codes.join(','),
+      limit: '200',
+      offset: String(offset || 0),
+      recordedDateRange: `${fromDate},${toDate}`,
+      searchType: 'advancedSearch',
+      keywordSearch: 'false',
+      searchOcrText: 'false'
+    });
+
+    const path = `/api/search/instruments?${params.toString()}`;
+
+    const options = {
+      hostname: BASE_HOST,
+      path: path,
+      method: 'GET',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Referer': 'https://bexar.tx.publicsearch.us/'
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Referer': 'https://bexar.tx.publicsearch.us/results',
+        'Origin': 'https://bexar.tx.publicsearch.us',
+        'x-requested-with': 'XMLHttpRequest'
       }
-    }, (res) => {
+    };
+
+    const req = https.request(options, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
-      res.on('end', () => resolve({ status: res.statusCode, body: data }));
-    }).on('error', reject);
+      res.on('end', () => resolve({ status: res.statusCode, body: data, headers: res.headers }));
+    });
+    req.on('error', reject);
+    req.setTimeout(25000, () => { req.destroy(); reject(new Error('Timeout')); });
+    req.end();
   });
 }
 
-function parseRecords(html, category, label) {
+function parseAPIResponse(body, category, label) {
   const records = [];
-  const nextDataMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-  if (nextDataMatch) {
-    try {
-      const nextData = JSON.parse(nextDataMatch[1]);
-      const results = nextData?.props?.pageProps?.results || nextData?.props?.pageProps?.searchResults || [];
-      results.forEach((r, i) => {
-        const docType = r.docType || r.instrumentType || label;
-        const parties = r.parties || [];
-        const owner = Array.isArray(parties) && parties.length > 0
-          ? (parties[0].name || 'Unknown').toUpperCase() : 'Unknown Owner';
-        const address = (r.legalDescription || r.address || r.situs || '').toUpperCase();
-        const docNum = r.documentNumber || r.instrumentNumber || '';
-        const msFlags = getMSFlags(category, docType);
-        records.push({
-          id: `${category}-${docNum || i}-${Date.now()}`,
-          address: address || 'SEE DOCUMENT',
-          owner,
-          category,
-          docType: docType.toUpperCase(),
-          date: r.recordedDate || r.instrumentDate || '',
-          docNum,
-          score: calcScore(msFlags),
-          msFlags,
-          isNew: true,
-          source: 'publicsearch',
-          url: `https://bexar.tx.publicsearch.us/doc/${docNum}`
-        });
+  try {
+    const json = JSON.parse(body);
+    const items = json.results || json.data || json.instruments ||
+                  json.searchResults || json.items || json.records ||
+                  (Array.isArray(json) ? json : null);
+
+    if (!items || !items.length) {
+      console.log(`  No items. Keys: ${Object.keys(json).join(', ')} | totalCount: ${json.totalCount || json.total || 'n/a'}`);
+      return records;
+    }
+
+    items.forEach((r, i) => {
+      const docType = r.docType || r.instrumentType || r.documentType || r.type || label;
+      const docNum = r.documentNumber || r.instrumentNumber || r.docNum || r.id || '';
+      const recDate = r.recordedDate || r.instrumentDate || r.filedDate || r.date || '';
+      const parties = r.parties || r.grantors || [];
+      let owner = 'Unknown Owner';
+      if (Array.isArray(parties) && parties.length > 0) {
+        owner = (parties[0].name || parties[0].fullName ||
+          ((parties[0].lastName || '') + ' ' + (parties[0].firstName || '')).trim() ||
+          'Unknown').toUpperCase().trim();
+      } else if (r.grantor) { owner = String(r.grantor).toUpperCase(); }
+      else if (r.owner) { owner = String(r.owner).toUpperCase(); }
+
+      const address = (r.legalDescription || r.address || r.situs ||
+                       r.propertyAddress || r.legalDesc || '').toString().toUpperCase();
+      const mailingAddress = (r.mailingAddress || r.mailing_address || '').toString().toUpperCase();
+      const msFlags = getMSFlags(category, docType);
+      const score = calcScore(msFlags);
+
+      records.push({
+        id: `${category}-${docNum || i}-${Date.now()}`,
+        address: address || 'SEE DOCUMENT',
+        mailingAddress: mailingAddress || address,
+        owner,
+        category,
+        docType: docType.toString().toUpperCase(),
+        date: recDate,
+        docNum: String(docNum),
+        score, msFlags,
+        isNew: true,
+        source: 'publicsearch',
+        url: `https://bexar.tx.publicsearch.us/doc/${docNum}`
       });
-    } catch(e) {}
+    });
+    console.log(`  Parsed ${records.length} records`);
+  } catch (e) {
+    console.log(`  Parse error: ${e.message} | Body: ${body.slice(0, 300)}`);
   }
   return records;
 }
 
-function getDateRange() {
-  const now = new Date();
-  const to = now.toISOString().slice(0,10).replace(/-/g,'');
-  const from = new Date(now - 7*24*60*60*1000).toISOString().slice(0,10).replace(/-/g,'');
-  return { from, to };
-}
-
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  if (req.method === 'OPTIONS') return res.status(200).end();
 
   const { from, to } = getDateRange();
   const allRecords = [];
   const errors = [];
   const summary = {};
+  const debug = [];
 
   for (const [key, docGroup] of Object.entries(DOC_TYPES)) {
     try {
-      const url = buildURL(docGroup.codes, from, to);
-      const response = await httpGet(url);
-      if (response.status === 200) {
-        const records = parseRecords(response.body, docGroup.category, docGroup.label);
+      const response = await fetchAPI(docGroup.codes, from, to, 0);
+      const ct = response.headers['content-type'] || '';
+      debug.push({ type: key, status: response.status, ct, preview: response.body.slice(0, 200) });
+
+      if (response.status === 200 && (ct.includes('json') || response.body.trim().startsWith('{') || response.body.trim().startsWith('['))) {
+        const records = parseAPIResponse(response.body, docGroup.category, docGroup.label);
         allRecords.push(...records);
         summary[key] = records.length;
       } else {
-        errors.push(`${key}: HTTP ${response.status}`);
+        errors.push(`${key}: HTTP ${response.status} | ${ct} | ${response.body.slice(0,100)}`);
         summary[key] = 0;
       }
-      await new Promise(r => setTimeout(r, 1500));
-    } catch(err) {
+      await new Promise(r => setTimeout(r, 1200));
+    } catch (err) {
       errors.push(`${key}: ${err.message}`);
       summary[key] = 0;
     }
@@ -143,7 +179,6 @@ module.exports = async function handler(req, res) {
     seen.add(k);
     return true;
   });
-
   deduped.sort((a, b) => b.score - a.score);
 
   return res.status(200).json({
@@ -151,8 +186,7 @@ module.exports = async function handler(req, res) {
     lastUpdated: new Date().toISOString(),
     fetchedFrom: `${from} to ${to}`,
     totalRecords: deduped.length,
-    summary,
-    errors,
+    summary, errors, debug,
     records: deduped
   });
 };
