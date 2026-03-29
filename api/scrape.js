@@ -1,11 +1,10 @@
 const https = require('https');
 
-// ─── ALL DATA FROM OFFICIAL BEXAR COUNTY OPEN ARCGIS ENDPOINTS ───────────────
-// No authentication required — these are fully public REST APIs
-
 const MS_WEIGHTS = {
-  taxdel:28, fc:22, lispendens:15, probate:14, bk:12,
-  judgment:10, divorce:10, multilien:8, absentee:7, vacant:6, llc:5
+  taxdel:30, probate:28, fc:22, lispendens:15,
+  over65:14, disabled:12, veteran:10, bk:10,
+  divorce:8, judgment:8, multilien:6,
+  homestead:3, absentee:5, vacant:4, llc:3
 };
 
 function calcScore(flags) {
@@ -15,12 +14,8 @@ function calcScore(flags) {
 function httpGet(url) {
   return new Promise((resolve, reject) => {
     const req = https.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0',
-        'Accept': 'application/json'
-      }
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
     }, (res) => {
-      // Follow redirects
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return httpGet(res.headers.location).then(resolve).catch(reject);
       }
@@ -29,198 +24,213 @@ function httpGet(url) {
       res.on('end', () => resolve({ status: res.statusCode, body: data }));
     });
     req.on('error', reject);
-    req.setTimeout(20000, () => { req.destroy(); reject(new Error('Timeout')); });
+    req.setTimeout(25000, () => { req.destroy(); reject(new Error('Timeout')); });
   });
 }
 
-// ─── SOURCE 1: Foreclosures (ArcGIS — live, open, no auth) ────────────────────
+// Parse BCAD Exempts field into MS flags
+// Exempts field contains codes like "HS,OA,DV4" or "HS" or "OA,DP"
+function parseExemptions(exempts, ownerName) {
+  const flags = [];
+  const ex = (exempts || '').toUpperCase();
+  const owner = (ownerName || '').toUpperCase();
+
+  // Probate — owner name contains estate keywords
+  if (owner.match(/\bEST(ATE)?\s+(OF\b|$)/) ||
+      owner.includes(' ETAL') || owner.includes('HEIRS') ||
+      owner.includes('ESTATE OF') || owner.match(/\bDECD\b/)) {
+    flags.push('probate');
+  }
+
+  // Homestead
+  if (ex.includes('HS')) flags.push('homestead');
+
+  // Over 65 / Senior
+  if (ex.includes('OA') || ex.includes('OVER65') || ex.includes('OVER 65')) flags.push('over65');
+
+  // Disabled Person
+  if (ex.includes('DP') && !ex.includes('DPV')) flags.push('disabled');
+
+  // Disabled Veteran (DV1-DV4, DVH, DVHS)
+  if (ex.match(/\bDV\d?\b/) || ex.includes('DVH')) flags.push('veteran');
+
+  // LLC / Corp
+  if (owner.match(/\bLLC\b|\bCORP\b|\bINC\b|\bLTD\b|L\.L\.C/)) flags.push('llc');
+
+  return [...new Set(flags)];
+}
+
+function exemptLabel(flags) {
+  if (flags.includes('probate')) return 'Probate/Estate';
+  if (flags.includes('over65')) return 'Senior 65+';
+  if (flags.includes('disabled')) return 'Disabled';
+  if (flags.includes('veteran')) return 'Veteran';
+  if (flags.includes('homestead')) return 'Homestead';
+  return 'Standard';
+}
+
+// ─── SOURCE 1: Foreclosures (ArcGIS live) ─────────────────────────────────────
 async function fetchForeclosures() {
   const records = [];
   try {
-    // Mortgage foreclosures
-    const url1 = 'https://maps.bexar.org/arcgis/rest/services/CC/ForeclosuresProd/MapServer/0/query?where=1%3D1&outFields=*&returnGeometry=false&f=json&resultRecordCount=500';
-    const r1 = await httpGet(url1);
-    const d1 = JSON.parse(r1.body);
-    (d1.features || []).forEach((f, i) => {
-      const a = f.attributes || {};
-      const addr = (a.ADDRESS || a.SITUS_ADDRESS || a.PROP_STREET || '').toUpperCase();
-      const flags = ['fc'];
-      records.push({
-        id: `fc-mort-${a.DOCNUM || i}`,
-        address: addr || 'SEE FILING',
-        mailingAddress: addr,
-        owner: (a.GRANTOR || a.OWNER || a.DEBTOR || 'See document').toUpperCase(),
-        category: 'foreclosure',
-        docType: 'NOTICE OF TRUSTEE SALE',
-        date: a.SALEDATE ? new Date(a.SALEDATE).toISOString().slice(0,10) : '',
-        docNum: String(a.DOCNUM || ''),
-        amount: parseFloat(a.AMOUNT || a.AMT || 0) || 0,
-        score: calcScore(flags),
-        msFlags: flags,
-        isNew: true,
-        source: 'Bexar County Foreclosure Map (ArcGIS)',
-        url: `https://maps.bexar.org/foreclosures/`
-      });
-    });
-
-    // Tax foreclosures
-    const url2 = 'https://maps.bexar.org/arcgis/rest/services/CC/ForeclosuresProd/MapServer/1/query?where=1%3D1&outFields=*&returnGeometry=false&f=json&resultRecordCount=500';
-    const r2 = await httpGet(url2);
-    const d2 = JSON.parse(r2.body);
-    (d2.features || []).forEach((f, i) => {
-      const a = f.attributes || {};
-      const addr = (a.ADDRESS || a.SITUS_ADDRESS || '').toUpperCase();
-      const flags = ['fc', 'taxdel'];
-      records.push({
-        id: `fc-tax-${a.DOCNUM || i}`,
-        address: addr || 'SEE FILING',
-        mailingAddress: addr,
-        owner: (a.GRANTOR || a.OWNER || a.DEBTOR || 'See document').toUpperCase(),
-        category: 'foreclosure',
-        docType: 'TAX FORECLOSURE NOTICE',
-        date: a.SALEDATE ? new Date(a.SALEDATE).toISOString().slice(0,10) : '',
-        docNum: String(a.DOCNUM || ''),
-        amount: parseFloat(a.AMOUNT || 0) || 0,
-        score: calcScore(flags),
-        msFlags: flags,
-        isNew: true,
-        source: 'Bexar County Foreclosure Map (ArcGIS)',
-        url: `https://maps.bexar.org/foreclosures/`
-      });
-    });
-
-    console.log(`Foreclosures: ${records.length} total`);
-  } catch(e) {
-    console.log(`Foreclosure error: ${e.message}`);
-  }
-  return records;
-}
-
-// ─── SOURCE 2: Tax Delinquent Properties (LGBS open feed) ─────────────────────
-async function fetchTaxDelinquent() {
-  const records = [];
-  try {
-    // Bexar County open data — delinquent tax properties
-    const url = 'https://opendata.arcgis.com/datasets/a9f4d5a8c3e74e8b9f2c1d6e0b7a3f5c_0.geojson';
-    // Try BCAD open parcel data with delinquent flag
-    const url2 = 'https://maps.bexar.org/arcgis/rest/services/Parcels/MapServer/0/query?where=DELQ_FLAG%3D%27Y%27&outFields=PROP_STREET,OWNER_NAME,MAILING_ADDR,MAILING_CITY,MAILING_STATE,MAILING_ZIP,DELQ_AMT,DELQ_YEAR&returnGeometry=false&f=json&resultRecordCount=500';
-    const r = await httpGet(url2);
-    if (r.status === 200) {
-      const d = JSON.parse(r.body);
-      (d.features || []).forEach((f, i) => {
-        const a = f.attributes || {};
-        const flags = ['taxdel'];
-        if ((a.OWNER_NAME || '').includes('ESTATE')) flags.push('probate');
-        if ((a.OWNER_NAME || '').match(/LLC|CORP|INC|LTD/)) flags.push('llc');
-        records.push({
-          id: `taxdel-${i}`,
-          address: (a.PROP_STREET || '').toUpperCase(),
-          mailingAddress: [a.MAILING_ADDR, a.MAILING_CITY, a.MAILING_STATE, a.MAILING_ZIP].filter(Boolean).join(', ').toUpperCase(),
-          owner: (a.OWNER_NAME || 'Unknown').toUpperCase(),
-          category: 'tax',
-          docType: 'TAX DELINQUENT',
-          date: a.DELQ_YEAR ? `${a.DELQ_YEAR}-01-01` : '',
-          docNum: String(a.PROP_ID || i),
-          amount: parseFloat(a.DELQ_AMT || 0) || 0,
-          score: calcScore(flags),
-          msFlags: flags,
-          isNew: false,
-          source: 'Bexar County Parcels (ArcGIS)',
-          url: 'https://bexar.acttax.com/act_webdev/bexar/index.jsp'
-        });
-      });
-      console.log(`Tax delinquent from parcels: ${records.length}`);
-    }
-  } catch(e) {
-    console.log(`Tax delinquent error: ${e.message}`);
-  }
-  return records;
-}
-
-// ─── SOURCE 3: LGBS Tax Sale List (monthly, open) ─────────────────────────────
-async function fetchTaxSaleList() {
-  const records = [];
-  try {
-    const url = 'https://taxsales.lgbs.com/api/properties?county=Bexar&state=TX&format=json&limit=500';
-    const r = await httpGet(url);
-    if (r.status === 200 && r.body.trim().startsWith('[') || r.body.trim().startsWith('{')) {
-      const d = JSON.parse(r.body);
-      const items = Array.isArray(d) ? d : d.properties || d.data || [];
-      items.forEach((p, i) => {
-        const flags = ['taxdel', 'fc'];
-        records.push({
-          id: `lgbs-${p.accountNumber || i}`,
-          address: (p.propertyAddress || p.address || '').toUpperCase(),
-          mailingAddress: (p.mailingAddress || p.propertyAddress || '').toUpperCase(),
-          owner: (p.ownerName || p.owner || 'Unknown').toUpperCase(),
-          category: 'tax',
-          docType: 'TAX SALE LISTING',
-          date: p.saleDate || '',
-          docNum: String(p.accountNumber || p.caseNumber || i),
-          amount: parseFloat(p.amountDue || p.totalDue || 0) || 0,
-          score: calcScore(flags),
-          msFlags: flags,
-          isNew: true,
-          source: 'LGBS Tax Sale List',
-          url: 'https://taxsales.lgbs.com/'
-        });
-      });
-      console.log(`LGBS tax sale: ${records.length}`);
-    }
-  } catch(e) {
-    console.log(`LGBS error: ${e.message}`);
-  }
-  return records;
-}
-
-// ─── SOURCE 4: Bexar County Open Data Portal ──────────────────────────────────
-async function fetchOpenData() {
-  const records = [];
-  try {
-    // Try Bexar open data ArcGIS feature services
-    const datasets = [
-      {
-        url: 'https://gis-bexar.opendata.arcgis.com/datasets/bexar::foreclosures.geojson?outSR=%7B%22latestWkid%22%3A3857%2C%22wkid%22%3A102100%7D&where=1%3D1&geometryType=esriGeometryEnvelope&spatialRel=esriSpatialRelIntersects&resultOffset=0&resultRecordCount=200&f=json',
-        category: 'foreclosure',
-        docType: 'FORECLOSURE',
-        flags: ['fc']
-      }
+    const urls = [
+      'https://maps.bexar.org/arcgis/rest/services/CC/ForeclosuresProd/MapServer/0/query?where=1%3D1&outFields=*&returnGeometry=false&f=json&resultRecordCount=1000',
+      'https://maps.bexar.org/arcgis/rest/services/CC/ForeclosuresProd/MapServer/1/query?where=1%3D1&outFields=*&returnGeometry=false&f=json&resultRecordCount=1000'
     ];
+    const types = ['Mortgage Foreclosure', 'Tax Foreclosure'];
 
-    for (const ds of datasets) {
-      try {
-        const r = await httpGet(ds.url);
-        if (r.status === 200) {
-          const d = JSON.parse(r.body);
-          const features = d.features || d.results || [];
-          features.forEach((f, i) => {
-            const a = f.attributes || f.properties || {};
-            const addr = Object.values(a).find(v => typeof v === 'string' && v.match(/\d+ \w/)) || '';
-            records.push({
-              id: `opendata-${ds.category}-${i}`,
-              address: addr.toUpperCase(),
-              mailingAddress: addr.toUpperCase(),
-              owner: (a.OWNER || a.owner || a.GRANTOR || 'See record').toUpperCase(),
-              category: ds.category,
-              docType: ds.docType,
-              date: a.DATE || a.RECORDED_DATE || a.date || '',
-              docNum: String(a.DOCNUM || a.ID || a.id || i),
-              amount: parseFloat(a.AMOUNT || a.amount || 0) || 0,
-              score: calcScore(ds.flags),
-              msFlags: ds.flags,
-              isNew: true,
-              source: 'Bexar Open Data Portal',
-              url: 'https://gis-bexar.opendata.arcgis.com/'
-            });
-          });
-        }
-      } catch(e2) {}
+    for (let i = 0; i < urls.length; i++) {
+      const r = await httpGet(urls[i]);
+      const d = JSON.parse(r.body);
+      (d.features || []).forEach((f, idx) => {
+        const a = f.attributes || {};
+        const addr = (a.ADDRESS || a.SITUS_ADDRESS || '').toUpperCase().trim();
+        if (!addr) return;
+        const flags = i === 1 ? ['fc', 'taxdel'] : ['fc'];
+        records.push({
+          id: `fc-${i}-${a.DOCNUM || idx}`,
+          address: addr,
+          mailingAddress: addr,
+          mailingCity: 'San Antonio',
+          mailingState: 'TX',
+          mailingZip: '',
+          city: 'San Antonio',
+          zip: '',
+          owner: (a.GRANTOR || a.OWNER || a.DEBTOR || 'SEE DOCUMENT').toUpperCase(),
+          firstName: '', lastName: '',
+          category: 'foreclosure',
+          docType: types[i].toUpperCase(),
+          date: a.SALEDATE ? new Date(a.SALEDATE).toISOString().slice(0,10) : '',
+          docNum: String(a.DOCNUM || ''),
+          amount: parseFloat(a.AMOUNT || 0) || 0,
+          score: calcScore(flags),
+          msFlags: flags,
+          exemptionType: 'fc',
+          isNew: true,
+          source: 'Bexar County Foreclosure Map (ArcGIS)',
+          url: 'https://maps.bexar.org/foreclosures/'
+        });
+      });
       await new Promise(r => setTimeout(r, 500));
     }
-    console.log(`Open data: ${records.length}`);
+    console.log(`Foreclosures: ${records.length}`);
   } catch(e) {
-    console.log(`Open data error: ${e.message}`);
+    console.log(`FC error: ${e.message}`);
   }
+  return records;
+}
+
+// ─── SOURCE 2: BCAD Parcels — Estate owners + exemption-flagged properties ─────
+// Uses the official Bexar County ArcGIS Parcels layer
+// Fields: Owner, Situs, AddrLn1, AddrCity, AddrSt, Zip, AcctNumb, Exempts, TotVal, PropUse
+async function fetchBCADProbate() {
+  const records = [];
+  const BASE = 'https://maps.bexar.org/arcgis/rest/services/Parcels/MapServer/0/query';
+  const FIELDS = 'Owner,Situs,AddrLn1,AddrLn2,AddrCity,AddrSt,Zip,AcctNumb,Exempts,TotVal,PropUse,LglDesc';
+
+  // Query 1: Estate / Probate owners by name
+  const queries = [
+    { where: "Owner LIKE '%EST OF%' OR Owner LIKE '%ESTATE OF%' OR Owner LIKE '%HEIRS%' OR Owner LIKE '% ETAL%'", label: 'probate' },
+    { where: "Exempts LIKE '%OA%'", label: 'over65' },
+    { where: "Exempts LIKE '%DP%'", label: 'disabled' },
+    { where: "Exempts LIKE '%DV%'", label: 'veteran' }
+  ];
+
+  for (const q of queries) {
+    try {
+      let offset = 0;
+      let hasMore = true;
+
+      while (hasMore && offset < 5000) {
+        const params = new URLSearchParams({
+          where: q.where,
+          outFields: FIELDS,
+          returnGeometry: 'false',
+          f: 'json',
+          resultRecordCount: '1000',
+          resultOffset: String(offset)
+        });
+
+        const r = await httpGet(`${BASE}?${params.toString()}`);
+        const d = JSON.parse(r.body);
+        const features = d.features || [];
+
+        features.forEach((f, i) => {
+          const a = f.attributes || {};
+          const owner = (a.Owner || '').toUpperCase().trim();
+          const situs = (a.Situs || '').toUpperCase().trim();
+          if (!situs && !owner) return;
+
+          // Mailing address from AddrLn1/AddrCity/AddrSt/Zip
+          const mailStreet = (a.AddrLn1 || a.AddrLn2 || situs).toUpperCase().trim();
+          const mailCity = (a.AddrCity || 'San Antonio').trim();
+          const mailState = (a.AddrSt || 'TX').trim();
+          const mailZip = String(a.Zip || '').trim();
+
+          // Check if absentee (mailing differs from property)
+          const isAbsentee = mailStreet && situs && !situs.startsWith(mailStreet.slice(0, 10));
+
+          // Parse exemptions from the Exempts field
+          const exemptFlags = parseExemptions(a.Exempts, owner);
+          const allFlags = [...new Set([...exemptFlags])];
+          if (isAbsentee) allFlags.push('absentee');
+          if (!allFlags.includes('probate') && q.label === 'probate') allFlags.push('probate');
+          if (!allFlags.includes('over65') && q.label === 'over65') allFlags.push('over65');
+          if (!allFlags.includes('disabled') && q.label === 'disabled') allFlags.push('disabled');
+          if (!allFlags.includes('veteran') && q.label === 'veteran') allFlags.push('veteran');
+          allFlags.push('taxdel'); // These are from the BCAD delinquent-related parcel layer
+
+          const score = calcScore(allFlags);
+          const acct = String(a.AcctNumb || '');
+
+          // Extract city/zip from Situs if available
+          // Situs format: "1234 MAIN ST  SAN ANTONIO TX 78205"
+          let propCity = 'San Antonio', propZip = '';
+          const situsMatch = situs.match(/\s+([A-Z ]+)\s+TX\s+(\d{5})/);
+          if (situsMatch) { propCity = situsMatch[1].trim(); propZip = situsMatch[2]; }
+
+          records.push({
+            id: `bcad-${q.label}-${acct || offset + i}`,
+            address: situs,
+            mailingAddress: mailStreet,
+            mailingCity: mailCity,
+            mailingState: mailState,
+            mailingZip: mailZip,
+            city: propCity,
+            zip: propZip,
+            owner,
+            firstName: '',
+            lastName: owner.split(' ')[0] || '',
+            category: q.label === 'probate' ? 'probate' : 'tax',
+            docType: `BCAD — ${exemptLabel(allFlags)}`,
+            date: '',
+            docNum: acct,
+            amount: parseFloat(a.TotVal || 0) || 0,
+            score,
+            msFlags: allFlags,
+            exemptionType: q.label,
+            exemptCodes: a.Exempts || '',
+            propUse: a.PropUse || '',
+            legalDesc: a.LglDesc || '',
+            isNew: false,
+            source: 'BCAD Parcels (ArcGIS)',
+            url: `https://esearch.bcad.org/Property/Details?PropertyID=${acct}`
+          });
+        });
+
+        offset += features.length;
+        hasMore = features.length === 1000 && !d.exceededTransferLimit === false;
+        if (features.length < 1000) hasMore = false;
+
+        await new Promise(r => setTimeout(r, 600));
+      }
+
+      console.log(`BCAD ${q.label}: ${records.filter(r => r.exemptionType === q.label).length} records`);
+    } catch(e) {
+      console.log(`BCAD ${q.label} error: ${e.message}`);
+    }
+  }
+
   return records;
 }
 
@@ -229,27 +239,22 @@ module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  console.log('Starting multi-source Bexar County scrape...');
+  console.log('Starting Bexar County scrape...');
 
-  // Run all sources in parallel for speed
-  const [fcRecords, taxRecords, lgbsRecords, openRecords] = await Promise.allSettled([
+  const [fcResult, bcadResult] = await Promise.allSettled([
     fetchForeclosures(),
-    fetchTaxDelinquent(),
-    fetchTaxSaleList(),
-    fetchOpenData()
+    fetchBCADProbate()
   ]);
 
   const allRecords = [
-    ...(fcRecords.value || []),
-    ...(taxRecords.value || []),
-    ...(lgbsRecords.value || []),
-    ...(openRecords.value || [])
+    ...(fcResult.value || []),
+    ...(bcadResult.value || [])
   ];
 
-  // Deduplicate
+  // Deduplicate by account number / address
   const seen = new Set();
   const deduped = allRecords.filter(r => {
-    const k = (r.docNum && r.docNum !== '0') ? r.docNum : r.id;
+    const k = (r.docNum && r.docNum !== '0') ? `acct-${r.docNum}` : `addr-${r.address}`;
     if (seen.has(k)) return false;
     seen.add(k);
     return true;
@@ -259,11 +264,14 @@ module.exports = async function handler(req, res) {
 
   const summary = {
     foreclosure: deduped.filter(r => r.category === 'foreclosure').length,
-    tax: deduped.filter(r => r.category === 'tax').length,
+    probate: deduped.filter(r => r.msFlags.includes('probate')).length,
+    over65: deduped.filter(r => r.msFlags.includes('over65')).length,
+    disabled: deduped.filter(r => r.msFlags.includes('disabled')).length,
+    veteran: deduped.filter(r => r.msFlags.includes('veteran')).length,
     total: deduped.length
   };
 
-  console.log(`Done. Total: ${deduped.length} records`);
+  console.log(`Done. Total: ${deduped.length}`, summary);
 
   return res.status(200).json({
     success: true,
