@@ -41,7 +41,7 @@ function parseExemptions(exempts, ownerName) {
     flags.push('probate');
   }
   if (ex.includes('HS')) flags.push('homestead');
-  if (ex.includes('OA')) flags.push('over65');
+  if (ex.includes('OA') || ex.includes('OVER') || ex.includes('65')) flags.push('over65');
   if (ex.includes('DP') && !ex.match(/DPV|DP1|DP2/)) flags.push('disabled');
   if (ex.match(/DV\d|DVH|DVHS/)) flags.push('veteran');
   if (owner.match(/\bLLC\b|\bCORP\b|\bINC\b|\bLTD\b|L\.L\.C/)) flags.push('llc');
@@ -175,7 +175,7 @@ module.exports = async function handler(req, res) {
   const [fcRes, probateRes, over65Res, disabledRes, veteranRes] = await Promise.allSettled([
     fetchForeclosures(),
     fetchBCADQuery("Owner LIKE '%EST OF%' OR Owner LIKE '%ESTATE OF%' OR Owner LIKE '%HEIRS%' OR Owner LIKE '% ETAL%'", 'probate'),
-    fetchBCADQuery("Exempts LIKE '%OA%'", 'over65'),
+    fetchBCADQuery("Exempts LIKE '%OA%' OR Exempts LIKE '%OVER%' OR Exempts LIKE '%65%'", 'over65'),
     fetchBCADQuery("Exempts LIKE '%DP%'", 'disabled'),
     fetchBCADQuery("Exempts LIKE '%DV%'", 'veteran')
   ]);
